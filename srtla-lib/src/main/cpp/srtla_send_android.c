@@ -108,6 +108,8 @@ typedef struct conn {
   double rtt_ms;                                // Current smoothed RTT in milliseconds
   uint64_t rtt_samples;                         // Number of RTT samples taken
   time_t last_rtt_update;                       // Last time we received an ACK
+  struct timespec keepalive_sent_at; // Pending request for bounded roundtrip
+  int keepalive_pending;
   int nak_penalty_percent;  // 0..60, recent attributed packet loss
   struct timespec nak_penalty_at; // CLOCK_MONOTONIC, avoids wall-clock jumps
   struct timespec last_delivery_proof;           // Monotonic time of earned SRTLA ACK only
@@ -700,11 +702,20 @@ void handle_srtla_data(conn_t *c) {
       return;
     }
 
-    case SRTLA_TYPE_KEEPALIVE:
-      /* An uncorrelated keepalive is not proof that video packets arrived.
-       * Only an earned SRTLA ACK may clear the stalled-path guard. */
-      debug("%s (%p): got a keepalive\n", print_addr(&c->src), c);
+    case SRTLA_TYPE_KEEPALIVE: {
+      /* Existing wire format is a two-byte echo without a nonce.
+       * Count only an outstanding, recently sent request as a bounded
+       * keepalive round-trip. Never credit unsolicited packets. */
+      struct timespec received_at;
+      if (n == 2 && c->keepalive_pending &&
+          clock_gettime(CLOCK_MONOTONIC, &received_at) == 0) {
+        int64_t age_ms = ((int64_t)received_at.tv_sec - c->keepalive_sent_at.tv_sec) * 1000
+            + ((int64_t)received_at.tv_nsec - c->keepalive_sent_at.tv_nsec) / 1000000;
+        if (age_ms >= 0 && age_ms <= 2000) c->last_delivery_proof = received_at;
+        c->keepalive_pending = 0;
+      }
       return; // don't send to SRT
+    }
 
     case SRTLA_TYPE_REG3:
       has_connected = 1;
@@ -969,8 +980,14 @@ void set_srtla_addr(struct addrinfo *addr) {
 void send_keepalive(conn_t *c) {
   debug("%s (%p): sending keepalive\n", print_addr(&c->src), c);
   uint16_t pkt = htobe16(SRTLA_TYPE_KEEPALIVE);
-  // ignoring the result on purpose
-  sendto(c->fd, &pkt, sizeof(pkt), 0, conn_dest(c), addr_len);
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+  if (sendto(c->fd, &pkt, sizeof(pkt), 0, conn_dest(c), addr_len) == (ssize_t)sizeof(pkt)) {
+    c->keepalive_sent_at = now;
+    c->keepalive_pending = 1;
+  } else {
+    c->keepalive_pending = 0;
+  }
 }
 
 #define HOUSEKEEPING_INT 1000 // ms
