@@ -108,7 +108,7 @@ typedef struct conn {
   double rtt_ms;                                // Current smoothed RTT in milliseconds
   uint64_t rtt_samples;                         // Number of RTT samples taken
   time_t last_rtt_update;                       // Last time we received an ACK
-  struct timespec last_delivery_proof;           // Monotonic time of earned ACK or keepalive response
+  struct timespec last_delivery_proof;           // Monotonic time of earned SRTLA ACK only
 } conn_t;
 
 // Forward declaration for bitrate functions
@@ -675,7 +675,8 @@ void handle_srtla_data(conn_t *c) {
     }
 
     case SRTLA_TYPE_KEEPALIVE:
-      clock_gettime(CLOCK_MONOTONIC, &c->last_delivery_proof);
+      /* An uncorrelated keepalive is not proof that video packets arrived.
+       * Only an earned SRTLA ACK may clear the stalled-path guard. */
       debug("%s (%p): got a keepalive\n", print_addr(&c->src), c);
       return; // don't send to SRT
 
