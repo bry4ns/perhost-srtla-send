@@ -110,6 +110,24 @@ int main(void) {
     wifi->in_flight_pkts = 0;
     cellular->in_flight_pkts = 7;
 
+    // Repeated NAKs from one uplink must reduce its selection score, not drop
+    // the entire bond or penalize the healthy peer.
+    wifi->last_rcvd = cellular->last_rcvd = now;
+    wifi->window = cellular->window = 20000;
+    wifi->in_flight_pkts = cellular->in_flight_pkts = 0;
+    wifi->last_delivery_proof = cellular->last_delivery_proof = monotonic_now;
+    wifi->pkt_idx = 1;
+    wifi->pkt_log[0] = 12345;
+    register_nak(12345);
+    assert(wifi->nak_penalty_percent == 8);
+    assert(cellular->nak_penalty_percent == 0);
+    assert(select_conn() == cellular);
+    // A healthy link remains usable even when the other is penalized.
+    wifi->window = 20000;
+    cellular->window = cell_window;
+    wifi->in_flight_pkts = 0;
+    cellular->in_flight_pkts = 7;
+
     // A failed leg must not set aggregate reconnecting while cellular is healthy.
     struct sockaddr_in *destination = (struct sockaddr_in *)&srtla_addr;
     destination->sin_family = AF_INET;
