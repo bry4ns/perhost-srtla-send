@@ -425,7 +425,7 @@ static int conn_stalled(const conn_t *c, const struct timespec *now) {
 
 conn_t *select_conn() {
   conn_t *best = NULL;
-  int best_score = -1;
+  int64_t best_score = -1;
   time_t t = 0;
   struct timespec now;
   if (get_seconds(&t) != 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0) return NULL;
@@ -448,13 +448,14 @@ conn_t *select_conn() {
       int64_t elapsed_ms = ((int64_t)now.tv_sec - c->nak_penalty_at.tv_sec) * 1000
           + ((int64_t)now.tv_nsec - c->nak_penalty_at.tv_nsec) / 1000000;
       if (elapsed_ms >= 1000) {
-        int decay = (int)(elapsed_ms / 1000) * 10;
+        int decay = (int)min(elapsed_ms / 1000, 6) * 10;
         c->nak_penalty_percent = max(0, c->nak_penalty_percent - decay);
         c->nak_penalty_at = now;
       }
     }
-    int score = (int)(((int64_t)c->window * (100 - c->nak_penalty_percent))
-        / ((int64_t)(c->in_flight_pkts + 1) * 100));
+    /* Fixed-point scoring preserves quality differences at high in-flight counts. */
+    int64_t score = ((int64_t)c->window * 1000 * (100 - c->nak_penalty_percent))
+        / ((int64_t)(c->in_flight_pkts + 1) * 100);
     if (score > best_score) {
       best = c;
       best_score = score;
@@ -522,7 +523,7 @@ void register_nak(int32_t packet) {
           if (c->nak_penalty_at.tv_sec != 0) {
             int64_t elapsed_ms = ((int64_t)nak_now.tv_sec - c->nak_penalty_at.tv_sec) * 1000
                 + ((int64_t)nak_now.tv_nsec - c->nak_penalty_at.tv_nsec) / 1000000;
-            if (elapsed_ms > 0) c->nak_penalty_percent = max(0, c->nak_penalty_percent - (int)(elapsed_ms / 1000) * 10);
+            if (elapsed_ms > 0) c->nak_penalty_percent = max(0, c->nak_penalty_percent - (int)min(elapsed_ms / 1000, 6) * 10);
           }
           c->nak_penalty_at = nak_now;
         }
