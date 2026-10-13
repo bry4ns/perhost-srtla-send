@@ -1,8 +1,8 @@
-name: SRTLA native handover tests
+name: SRTLA native regression tests
 on:
   pull_request:
   push:
-    branches: [main, "fix/srtla-handover-bitrate"]
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -10,9 +10,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: dimadesu/srtla
-          ref: b81ceb604e5d848aa1e6cf2157114f4cf9708b9b
-          path: srtla
-      - run: sh tests/native/run.sh
+      - name: Build and run sanitizer-backed network regression tests
+        run: sh tests/native/run.sh
