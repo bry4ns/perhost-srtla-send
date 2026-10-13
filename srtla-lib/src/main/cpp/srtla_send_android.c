@@ -112,7 +112,7 @@ typedef struct conn {
   int keepalive_pending;
   int nak_penalty_percent;  // 0..60, recent attributed packet loss
   struct timespec nak_penalty_at; // CLOCK_MONOTONIC, avoids wall-clock jumps
-  struct timespec last_delivery_proof;           // Monotonic time of earned SRTLA ACK only
+  struct timespec last_delivery_proof;           // Monotonic time of earned ACK or bounded keepalive response
 } conn_t;
 
 // Forward declaration for bitrate functions
@@ -837,6 +837,8 @@ int setup_conns(char *source_ip_file) {
           c->rtt_samples = 0;
           c->last_rtt_update = 0;
           memset(&c->last_delivery_proof, 0, sizeof(c->last_delivery_proof));
+          c->keepalive_pending = 0;
+          memset(&c->keepalive_sent_at, 0, sizeof(c->keepalive_sent_at));
           for (int i = 0; i < PKT_LOG_SZ; i++) c->pkt_log[i] = -1;
           if (pending_reg2_conn == c) pending_reg2_conn = NULL;
         }
