@@ -48,7 +48,47 @@ static void *poll_stats(void *unused) {
     return NULL;
 }
 
+static void test_three_link_failure(void) {
+    conn_t *previous = conns;
+    conn_t wifi = {0}, sim1 = {0}, sim2 = {0};
+    wifi.next = &sim1;
+    sim1.next = &sim2;
+    conns = &wifi;
+    time_t now;
+    struct timespec tick;
+    assert(get_seconds(&now) == 0);
+    assert(clock_gettime(CLOCK_MONOTONIC, &tick) == 0);
+    wifi.last_rcvd = sim1.last_rcvd = sim2.last_rcvd = now;
+    wifi.window = sim1.window = sim2.window = 20000;
+    wifi.last_delivery_proof = sim1.last_delivery_proof = sim2.last_delivery_proof = tick;
+    wifi.in_flight_pkts = 0;
+    sim1.in_flight_pkts = 0;
+    sim2.in_flight_pkts = 0;
+
+    // One modem loses all connectivity; the bond still has two usable legs.
+    sim1.last_rcvd = 1;
+    for (int i = 0; i < 50; ++i) {
+        conn_t *selected = select_conn();
+        assert(selected == &wifi || selected == &sim2);
+    }
+
+    // One modem is still registered but its data path has stopped advancing.
+    sim1.last_rcvd = now;
+    sim1.in_flight_pkts = 40;
+    sim1.last_delivery_proof.tv_sec -= 4;
+    for (int i = 0; i < 50; ++i) {
+        conn_t *selected = select_conn();
+        assert(selected == &wifi || selected == &sim2);
+    }
+
+    // The other cellular link can degrade independently without losing Wi-Fi.
+    sim2.nak_penalty_percent = 60;
+    assert(select_conn() == &wifi);
+    conns = previous;
+}
+
 int main(void) {
+    test_three_link_failure();
     char path[] = "/tmp/srtla-handover-XXXXXX";
     int config_fd = mkstemp(path);
     assert(config_fd >= 0);
