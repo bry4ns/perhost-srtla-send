@@ -108,6 +108,8 @@ typedef struct conn {
   double rtt_ms;                                // Current smoothed RTT in milliseconds
   uint64_t rtt_samples;                         // Number of RTT samples taken
   time_t last_rtt_update;                       // Last time we received an ACK
+  int nak_penalty_percent;  // 0..60, recent attributed packet loss
+  struct timespec nak_penalty_at; // CLOCK_MONOTONIC, avoids wall-clock jumps
   struct timespec last_delivery_proof;           // Monotonic time of earned SRTLA ACK only
 } conn_t;
 
@@ -423,7 +425,7 @@ static int conn_stalled(const conn_t *c, const struct timespec *now) {
 
 conn_t *select_conn() {
   conn_t *best = NULL;
-  int best_score = -1;
+  int64_t best_score = -1;
   time_t t = 0;
   struct timespec now;
   if (get_seconds(&t) != 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0) return NULL;
@@ -440,7 +442,20 @@ conn_t *select_conn() {
   for (conn_t *c = conns; c != NULL; c = c->next) {
     if (conn_timed_out(c, t)) continue;
     if (has_healthy_alternative && conn_stalled(c, &now)) continue;
-    int score = c->window / (c->in_flight_pkts + 1);
+    /* Penalize recently lossy uplinks without disconnecting them.
+     * Monotonic decay lets a recovered link rejoin automatically. */
+    if (c->nak_penalty_at.tv_sec != 0) {
+      int64_t elapsed_ms = ((int64_t)now.tv_sec - c->nak_penalty_at.tv_sec) * 1000
+          + ((int64_t)now.tv_nsec - c->nak_penalty_at.tv_nsec) / 1000000;
+      if (elapsed_ms >= 1000) {
+        int decay = (int)min(elapsed_ms / 1000, 6) * 10;
+        c->nak_penalty_percent = max(0, c->nak_penalty_percent - decay);
+        c->nak_penalty_at = now;
+      }
+    }
+    /* Fixed-point scoring preserves quality differences at high in-flight counts. */
+    int64_t score = ((int64_t)c->window * 1000 * (100 - c->nak_penalty_percent))
+        / ((int64_t)(c->in_flight_pkts + 1) * 100);
     if (score > best_score) {
       best = c;
       best_score = score;
@@ -502,6 +517,17 @@ void register_nak(int32_t packet) {
         c->pkt_log[i] = -1;
         // It might be better to use exponential decay like this
         //c->window = c->window * 998 / 1000;
+        /* Attribute packet loss to the actual sending path. */
+        struct timespec nak_now;
+        if (clock_gettime(CLOCK_MONOTONIC, &nak_now) == 0) {
+          if (c->nak_penalty_at.tv_sec != 0) {
+            int64_t elapsed_ms = ((int64_t)nak_now.tv_sec - c->nak_penalty_at.tv_sec) * 1000
+                + ((int64_t)nak_now.tv_nsec - c->nak_penalty_at.tv_nsec) / 1000000;
+            if (elapsed_ms > 0) c->nak_penalty_percent = max(0, c->nak_penalty_percent - (int)min(elapsed_ms / 1000, 6) * 10);
+          }
+          c->nak_penalty_at = nak_now;
+        }
+        c->nak_penalty_percent = min(60, c->nak_penalty_percent + 8);
         c->window -= WINDOW_DECR;
         c->window = max(c->window, WINDOW_MIN*WINDOW_MULT);
         debug("%s (%p): found NAKed packet %d in the log\n",
