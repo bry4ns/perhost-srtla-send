@@ -87,8 +87,44 @@ static void test_three_link_failure(void) {
     conns = previous;
 }
 
+static void test_keepalive_recovery(void) {
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
+    conn_t c = {0};
+    c.fd = sockets[0];
+    c.window = 20000;
+    struct timespec tick;
+    assert(clock_gettime(CLOCK_MONOTONIC, &tick) == 0);
+    uint16_t packet = htobe16(SRTLA_TYPE_KEEPALIVE);
+    // An unsolicited response must not count as delivery proof.
+    assert(send(sockets[1], &packet, sizeof(packet), 0) == sizeof(packet));
+    handle_srtla_data(&c);
+    assert(c.last_delivery_proof.tv_sec == 0);
+
+    // An outstanding request with a recent response revives the path.
+    c.keepalive_pending = 1;
+    c.keepalive_sent_at = tick;
+    assert(send(sockets[1], &packet, sizeof(packet), 0) == sizeof(packet));
+    handle_srtla_data(&c);
+    assert(c.keepalive_pending == 0);
+    assert(c.last_delivery_proof.tv_sec != 0);
+
+    // A late response does not count, and clears pending state.
+    c.last_delivery_proof.tv_sec = 0;
+    c.last_delivery_proof.tv_nsec = 0;
+    c.keepalive_pending = 1;
+    c.keepalive_sent_at = tick;
+    c.keepalive_sent_at.tv_sec -= 5;
+    assert(send(sockets[1], &packet, sizeof(packet), 0) == sizeof(packet));
+    handle_srtla_data(&c);
+    assert(c.keepalive_pending == 0 && c.last_delivery_proof.tv_sec == 0);
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
 int main(void) {
     test_three_link_failure();
+    test_keepalive_recovery();
     char path[] = "/tmp/srtla-handover-XXXXXX";
     int config_fd = mkstemp(path);
     assert(config_fd >= 0);
