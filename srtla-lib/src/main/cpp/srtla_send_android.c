@@ -1,0 +1,1817 @@
+/*
+    srtla - SRT transport proxy with link aggregation
+    Copyright (C) 2020-2021 BELABOX project
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+/* Android sender based on dimadesu/srtla b81ceb604e5d848aa1e6cf2157114f4cf9708b9b.
+ * Local changes: synchronized socket snapshots, handover on the sender thread,
+ * and aggregate reconnect status. See docs/SRTLA_HANDOVER.md.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#ifdef ANDROID
+#include <android/log.h>
+#include <pthread.h>
+#endif
+
+#include "common.h"
+#include "android_compat.h"  // Android compatibility layer
+
+#define PKT_LOG_SZ 256
+#define CONN_TIMEOUT 4
+#define REG2_TIMEOUT 4
+#define REG3_TIMEOUT 4
+#ifdef ANDROID
+#define GLOBAL_TIMEOUT 5  // Faster reconnect detection on Android
+#else
+#define GLOBAL_TIMEOUT 10
+#endif
+#define IDLE_TIME 1
+
+#define SEND_BUF_SIZE (8 * 1024 * 1024)
+
+#define min(a, b) ((a < b) ? a : b)
+#define max(a, b) ((a > b) ? a : b)
+#define min_max(a, l, h) (max(min((a), (h)), (l)))
+
+#define WINDOW_MIN 1
+#define WINDOW_DEF 20
+#define WINDOW_MAX 60
+#define WINDOW_MULT 1000
+#define WINDOW_DECR 100
+#define WINDOW_INCR 30
+
+#define LOG_PKT_INT 20
+
+// Bitrate calculation constants
+#define BITRATE_UPDATE_INTERVAL_SECONDS 2  // Update bitrate every 2 seconds (matching Java)
+
+#ifdef ANDROID
+typedef enum {
+    NETWORK_TYPE_UNKNOWN = 0,
+    NETWORK_TYPE_WIFI = 1,
+    NETWORK_TYPE_CELLULAR = 2
+} network_type_t;
+#endif
+
+typedef struct conn {
+  struct conn *next;
+  int fd;
+  time_t last_rcvd;
+  time_t last_sent;
+  struct sockaddr src;       // Virtual address for SRTLA's internal use
+#ifdef ANDROID
+  struct sockaddr real_src;  // Real network address for actual I/O
+  network_type_t network_type;
+  char virtual_ip[16];
+  char real_ip[16];
+  struct sockaddr dest_addr; // Per-connection destination (Moblink relay endpoint)
+  int has_custom_dest;       // 1 = send to dest_addr instead of global srtla_addr
+  char display_name[32];     // Human-readable label for stats UI (e.g. relay name)
+#endif
+  int removed;
+  int in_flight_pkts;
+  int window;
+  int pkt_idx;
+  int pkt_log[PKT_LOG_SZ];
+  // Bitrate tracking (matching Java implementation)
+  uint64_t bytes_sent_total;
+  uint64_t bytes_sent_window;  // Last bytes snapshot for difference calculation
+  time_t last_rate_update;     // Last time we updated the rate measurement
+  double current_bitrate_bps;  // Current bitrate in bits per second
+  // RTT tracking
+  struct timespec pkt_send_times[PKT_LOG_SZ];  // Timestamp for each packet
+  double rtt_ms;                                // Current smoothed RTT in milliseconds
+  uint64_t rtt_samples;                         // Number of RTT samples taken
+  time_t last_rtt_update;                       // Last time we received an ACK
+  struct timespec last_delivery_proof;           // Monotonic time of earned ACK or keepalive response
+} conn_t;
+
+// Forward declaration for bitrate functions
+static void update_connection_bitrate(conn_t *c, uint64_t bytes_sent);
+static void update_individual_connection_bitrate(conn_t *c);
+static double calculate_total_bitrate(void);
+static int calculate_connection_load_percentage(conn_t *c);
+
+// Forward declaration for connection tracking
+void check_connection_established(void);
+
+char *source_ip_file = NULL;
+
+#ifdef ANDROID
+// Global stop flag for Android - allows graceful shutdown
+static volatile int srtla_should_stop = 0;
+
+// Forward declaration for FD ownership check (implemented in JNI layer)
+extern int srtla_is_java_owned_fd(int fd);
+
+// Virtual IP definitions for Application-Level Virtual IPs
+#define VIRTUAL_IP_WIFI     "10.0.1.1"
+#define VIRTUAL_IP_CELLULAR "10.0.2.1" 
+#define VIRTUAL_IP_PREFIX   "10.0."
+
+typedef struct virtual_conn {
+    char virtual_ip[16];          // e.g., "10.0.1.1"
+    char real_ip[16];            // e.g., "172.20.10.2"  
+    network_type_t network_type; // WIFI or CELLULAR
+    int socket_fd;               // Pre-bound network socket from Android
+    struct sockaddr real_addr;   // Real network address
+    struct sockaddr dest_addr;   // Per-connection destination (Moblink relay endpoint)
+    int has_custom_dest;         // 1 = relay connection with a custom destination
+    char display_name[32];       // Human-readable label for stats UI (e.g. relay name)
+    struct virtual_conn *next;
+} virtual_conn_t;
+
+static virtual_conn_t *virtual_connections = NULL;
+static pthread_mutex_t virtual_connections_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// JNI telemetry and the sender share conns. In particular, a network removal
+// must not free a connection while the stats panel is traversing it.
+void srtla_lock_connections(void) { pthread_mutex_lock(&connections_mutex); }
+void srtla_unlock_connections(void) { pthread_mutex_unlock(&connections_mutex); }
+#endif
+
+int do_update_conns = 0;
+
+struct addrinfo *addrs;
+
+#ifdef ANDROID
+// Virtual IP management functions
+
+// Add a virtual connection mapping
+int add_virtual_connection(const char* virtual_ip, const char* real_ip, 
+                          network_type_t type, int socket_fd) {
+    virtual_conn_t *vc = malloc(sizeof(virtual_conn_t));
+    if (!vc) return -1;
+    
+    memset(vc, 0, sizeof(virtual_conn_t));
+    strncpy(vc->virtual_ip, virtual_ip, sizeof(vc->virtual_ip)-1);
+    strncpy(vc->real_ip, real_ip, sizeof(vc->real_ip)-1);
+    vc->network_type = type;
+    vc->socket_fd = socket_fd;
+    
+    // Parse real IP into sockaddr
+    struct sockaddr_in *addr = (struct sockaddr_in*)&vc->real_addr;
+    addr->sin_family = AF_INET;
+    if (inet_pton(AF_INET, real_ip, &addr->sin_addr) != 1) {
+        free(vc);
+        return -1;
+    }
+    addr->sin_port = htons(0);
+    
+    // Add to linked list
+    pthread_mutex_lock(&virtual_connections_mutex);
+    vc->next = virtual_connections;
+    virtual_connections = vc;
+    pthread_mutex_unlock(&virtual_connections_mutex);
+    
+    info("Added virtual connection: %s -> %s (type=%d, fd=%d)\n", 
+         virtual_ip, real_ip, type, socket_fd);
+    return 0;
+}
+
+// Find virtual connection by virtual IP
+int copy_virtual_connection(const char* virtual_ip, virtual_conn_t *snapshot) {
+    pthread_mutex_lock(&virtual_connections_mutex);
+    for (virtual_conn_t *vc = virtual_connections; vc != NULL; vc = vc->next) {
+        if (strcmp(vc->virtual_ip, virtual_ip) == 0) {
+            *snapshot = *vc;
+            pthread_mutex_unlock(&virtual_connections_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&virtual_connections_mutex);
+    return 0;
+}
+
+// Check if IP is in virtual range
+int is_virtual_ip(const char* ip) {
+    return strncmp(ip, VIRTUAL_IP_PREFIX, strlen(VIRTUAL_IP_PREFIX)) == 0;
+}
+
+// Convert real IP to virtual IP for SRTLA's internal use
+const char* real_to_virtual_ip(const char* real_ip) {
+    for (virtual_conn_t *vc = virtual_connections; vc != NULL; vc = vc->next) {
+        if (strcmp(vc->real_ip, real_ip) == 0) {
+            return vc->virtual_ip;
+        }
+    }
+    return real_ip; // Fallback to real IP if no mapping found
+}
+
+// Get routing address (real address for network I/O)
+struct sockaddr* get_routing_address(conn_t *c) {
+#ifdef ANDROID
+    if (strlen(c->virtual_ip) > 0) {
+        return &c->real_src;  // Use real address for actual network I/O
+    }
+#endif
+    return &c->src;  // Use original address for non-virtual
+}
+
+// JNI function to receive pre-bound socket from Android
+void srtla_set_network_socket(const char* virtual_ip, const char* real_ip, 
+                             int network_type, int socket_fd) {
+    add_virtual_connection(virtual_ip, real_ip, (network_type_t)network_type, socket_fd);
+}
+
+// Add a Moblink relay connection. The socket is pre-bound to the local network
+// (typically Wi-Fi) by Java; unlike a normal connection, packets are sent to the
+// relay's tunnel endpoint instead of the global SRTLA receiver address.
+int add_relay_connection(const char* virtual_ip, const char* relay_ip,
+                         int relay_port, int socket_fd, const char* name) {
+    virtual_conn_t *vc = malloc(sizeof(virtual_conn_t));
+    if (!vc) return -1;
+
+    memset(vc, 0, sizeof(virtual_conn_t));
+    strncpy(vc->virtual_ip, virtual_ip, sizeof(vc->virtual_ip)-1);
+    strncpy(vc->real_ip, relay_ip, sizeof(vc->real_ip)-1);
+    vc->network_type = NETWORK_TYPE_WIFI;
+    vc->socket_fd = socket_fd;
+
+    // Display name for stats UI
+    if (name && name[0] != '\0') {
+        strncpy(vc->display_name, name, sizeof(vc->display_name)-1);
+    } else {
+        strncpy(vc->display_name, "RELAY", sizeof(vc->display_name)-1);
+    }
+
+    // real_addr is unused for sending on relay connections (dest_addr is used),
+    // but keep the family valid for any logging/inspection.
+    struct sockaddr_in *real = (struct sockaddr_in*)&vc->real_addr;
+    real->sin_family = AF_INET;
+
+    // Destination is the relay's tunnel endpoint.
+    struct sockaddr_in *dst = (struct sockaddr_in*)&vc->dest_addr;
+    dst->sin_family = AF_INET;
+    dst->sin_port = htons((uint16_t)relay_port);
+    if (inet_pton(AF_INET, relay_ip, &dst->sin_addr) != 1) {
+        free(vc);
+        return -1;
+    }
+    vc->has_custom_dest = 1;
+
+    pthread_mutex_lock(&virtual_connections_mutex);
+    vc->next = virtual_connections;
+    virtual_connections = vc;
+    pthread_mutex_unlock(&virtual_connections_mutex);
+
+    info("Added Moblink relay connection: %s -> relay %s:%d '%s' (fd=%d)\n",
+         virtual_ip, relay_ip, relay_port, vc->display_name, socket_fd);
+    return 0;
+}
+
+// JNI function to register a Moblink relay's pre-bound socket and endpoint
+void srtla_set_relay_socket(const char* virtual_ip, const char* relay_ip,
+                            int relay_port, int socket_fd, const char* name) {
+    add_relay_connection(virtual_ip, relay_ip, relay_port, socket_fd, name);
+}
+#endif
+
+struct sockaddr srtla_addr, srt_addr;
+const socklen_t addr_len = sizeof(srtla_addr);
+conn_t *conns = NULL;
+int listenfd;
+int active_connections = 0;
+int has_connected = 0;
+volatile int is_reconnecting = 0;  // Track if we're in reconnecting state (volatile for thread safety)
+
+conn_t *pending_reg2_conn = NULL;
+time_t pending_reg_timeout = 0;
+
+char srtla_id[SRTLA_ID_LEN];
+
+
+/*
+
+Async I/O support
+
+*/
+fd_set active_fds;
+int max_act_fd = -1;
+
+int add_active_fd(int fd) {
+  if (fd < 0) return -1;
+
+  if (fd > max_act_fd) max_act_fd = fd;
+  FD_SET(fd, &active_fds);
+
+  return 0;
+}
+
+int remove_active_fd(int fd) {
+  if (fd < 0) return -1;
+
+  FD_CLR(fd, &active_fds);
+
+  return 0;
+}
+
+
+/*
+
+Misc helper functions
+
+*/
+void print_help() {
+  fprintf(stderr,
+          "Syntax: srtla_send SRT_LISTEN_PORT SRTLA_HOST SRTLA_PORT BIND_IPS_FILE\n\n"
+          "-v      Print the version and exit\n");
+}
+
+
+/*
+
+srtla registration helpers
+
+*/
+/* Returns the destination address for a connection: a per-connection relay
+   endpoint when set (Moblink), otherwise the global SRTLA receiver address. */
+static struct sockaddr *conn_dest(conn_t *c) {
+#ifdef ANDROID
+  if (c->has_custom_dest) return &c->dest_addr;
+#endif
+  return &srtla_addr;
+}
+
+int send_reg1(conn_t *c) {
+  if (c->fd < 0) return -1;
+
+  char buf[MTU];
+  uint16_t packet_type = htobe16(SRTLA_TYPE_REG1);
+  memcpy(buf, &packet_type, sizeof(packet_type));
+  memcpy(buf + sizeof(packet_type), srtla_id, SRTLA_ID_LEN);
+
+  int ret = sendto(c->fd, buf, SRTLA_TYPE_REG1_LEN, 0, conn_dest(c), addr_len);
+  if (ret != SRTLA_TYPE_REG1_LEN) return -1;
+
+  return 0;
+}
+
+int send_reg2(conn_t *c) {
+  if (c->fd < 0) return -1;
+
+  char buf[SRTLA_TYPE_REG2_LEN];
+  uint16_t packet_type = htobe16(SRTLA_TYPE_REG2);
+  memcpy(buf, &packet_type, sizeof(packet_type));
+  memcpy(buf + sizeof(packet_type), srtla_id, SRTLA_ID_LEN);
+
+  int ret = sendto(c->fd, buf, SRTLA_TYPE_REG2_LEN, 0, conn_dest(c), addr_len);
+  return (ret == SRTLA_TYPE_REG2_LEN) ? 0 : -1;
+}
+
+
+/*
+
+Handling code for packets coming from the SRT caller
+
+*/
+void reg_pkt(conn_t *c, int32_t packet) {
+  debug("%s (%p): register packet %d at idx %d\n",
+        print_addr(&c->src), c, packet, c->pkt_idx);
+  c->pkt_log[c->pkt_idx] = packet;
+  
+  // Record send timestamp for RTT calculation
+  clock_gettime(CLOCK_MONOTONIC, &c->pkt_send_times[c->pkt_idx]);
+  
+  c->pkt_idx++;
+  c->pkt_idx %= PKT_LOG_SZ;
+
+  c->in_flight_pkts++;
+}
+
+int conn_timed_out(conn_t *c, time_t ts) {
+  return (c->last_rcvd + CONN_TIMEOUT) < ts;
+}
+
+/* Keep packets off a stalled uplink while another link still delivers.
+ * Based on irlserver/srtla_send's stalled-link deselection concept.
+ * Do not remove or re-register the stalled link: keepalives can revive it.
+ * Monotonic delivery proof avoids mistaking arbitrary incoming packets for progress.
+ */
+static int conn_stalled(const conn_t *c, const struct timespec *now) {
+  if (c->in_flight_pkts < 32 || c->last_delivery_proof.tv_sec == 0) return 0;
+  int64_t elapsed_ms = ((int64_t)now->tv_sec - c->last_delivery_proof.tv_sec) * 1000
+      + ((int64_t)now->tv_nsec - c->last_delivery_proof.tv_nsec) / 1000000;
+  return elapsed_ms >= 3000;
+}
+
+conn_t *select_conn() {
+  conn_t *best = NULL;
+  int best_score = -1;
+  time_t t = 0;
+  struct timespec now;
+  if (get_seconds(&t) != 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0) return NULL;
+
+  /* Only deselect a stalled path if another live path can carry traffic.
+   * Preserve the single-link fallback rather than dropping every packet. */
+  int has_healthy_alternative = 0;
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (!conn_timed_out(c, t) && !conn_stalled(c, &now)) {
+      has_healthy_alternative = 1;
+      break;
+    }
+  }
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (conn_timed_out(c, t)) continue;
+    if (has_healthy_alternative && conn_stalled(c, &now)) continue;
+    int score = c->window / (c->in_flight_pkts + 1);
+    if (score > best_score) {
+      best = c;
+      best_score = score;
+    }
+  }
+  if (best) best->last_sent = t;
+  return best;
+}
+
+void handle_srt_data(int fd) {
+  char buf[MTU];
+  socklen_t len = sizeof(srt_addr);
+  int n = recvfrom(fd, &buf, MTU, 0, &srt_addr, &len);
+
+  conn_t *c = select_conn();
+  if (c) {
+    int32_t sn = get_srt_sn(buf, n);
+    int ret = sendto(c->fd, &buf, n, 0, conn_dest(c), addr_len);
+    if (ret == n) {
+      // Track bytes sent for bitrate calculation
+      update_connection_bitrate(c, n);
+      
+      if (sn >= 0) {
+        reg_pkt(c, sn);
+      }
+    } else {
+      /* If sending the packet fails, adjust the timestamp to disable the link until a
+         reconnection is confirmed. 1 so connection_housekeeping() prints its message */
+      c->last_rcvd = 1;
+      err("%s (%p): sendto() failed, disabling the connection\n",
+          print_addr(&c->src), c);
+    }
+  }
+}
+
+
+/*
+
+Handling code for packets coming from the receiver
+
+*/
+int get_pkt_idx(int idx, int increment) {
+  idx = idx + increment;
+  if (idx < 0) idx += PKT_LOG_SZ;
+  idx %= PKT_LOG_SZ;
+  // Safety check - should never fail given the math above
+  if (idx < 0 || idx >= PKT_LOG_SZ) {
+    err("get_pkt_idx: idx %d out of bounds [0, %d)\n", idx, PKT_LOG_SZ);
+    return 0;  // Return safe default
+  }
+  return idx;
+}
+
+void register_nak(int32_t packet) {
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    int idx = get_pkt_idx(c->pkt_idx, -1);
+    for (int i = idx; i != c->pkt_idx; i = get_pkt_idx(i, -1)) {
+      if (c->pkt_log[i] == packet) {
+        c->pkt_log[i] = -1;
+        // It might be better to use exponential decay like this
+        //c->window = c->window * 998 / 1000;
+        c->window -= WINDOW_DECR;
+        c->window = max(c->window, WINDOW_MIN*WINDOW_MULT);
+        debug("%s (%p): found NAKed packet %d in the log\n",
+              print_addr(&c->src), c, packet);
+        return;
+      }
+    }
+  }
+
+  debug("Didn't find NAKed packet %d in our logs\n", packet);
+}
+
+void register_srtla_ack(int32_t ack) {
+  int found = 0;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    int idx = get_pkt_idx(c->pkt_idx, -1);
+    for (int i = idx; i != c->pkt_idx && !found; i = get_pkt_idx(i, -1)) {
+      if (c->pkt_log[i] == ack) {
+        found = 1;
+        if (c->in_flight_pkts > 0) {
+          c->in_flight_pkts--;
+        }
+        
+        // Calculate RTT for this packet
+        struct timespec *sent_time = &c->pkt_send_times[i];
+        double rtt_sample = (now.tv_sec - sent_time->tv_sec) * 1000.0 +
+                           (now.tv_nsec - sent_time->tv_nsec) / 1000000.0;
+        
+        // Smooth RTT using exponential moving average (90% old, 10% new)
+        if (c->rtt_samples == 0) {
+          c->rtt_ms = rtt_sample;
+        } else {
+          c->rtt_ms = 0.9 * c->rtt_ms + 0.1 * rtt_sample;
+        }
+        c->rtt_samples++;
+        c->last_rtt_update = time(NULL);  // Track when we last received an ACK
+        c->last_delivery_proof = now;
+        
+        c->pkt_log[i] = -1;
+
+        if (c->in_flight_pkts*WINDOW_MULT > c->window) {
+          c->window += WINDOW_INCR - 1;
+        }
+
+        break;
+      }
+    }
+
+    if (c->last_rcvd != 0) {
+      c->window += 1;
+      c->window = min(c->window, WINDOW_MAX*WINDOW_MULT);
+    }
+  }
+}
+
+/*
+  TODO after the sequence number overflows, we should probably also mark high
+  sn packets as received. However, this shouldn't normally be an issue as SRTLA
+  ACKs acknowledge each packet individually. Also, if the SRTLA ACK is lost,
+  stale entries will be overwritten soon enough as pkt_log is a circular buffer
+*/
+void conn_register_srt_ack(conn_t *c, int32_t ack) {
+  int count = 0;
+  int idx = get_pkt_idx(c->pkt_idx, -1);
+  for (int i = idx; i != c->pkt_idx; i = get_pkt_idx(i, -1)) {
+    if (c->pkt_log[i] < ack) {
+      c->pkt_log[i] = -1;
+    } else {
+      count++;
+    }
+  }
+  c->in_flight_pkts = count;
+}
+
+void register_srt_ack(int32_t ack) {
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    conn_register_srt_ack(c, ack);
+  }
+}
+
+void handle_srtla_data(conn_t *c) {
+  char buf[MTU];
+
+  int n = recvfrom(c->fd, &buf, MTU, 0, NULL, NULL);
+  if (n <= 0) return;
+
+  time_t ts;
+  get_seconds(&ts);
+
+  uint16_t packet_type = get_srt_type(buf, n);
+
+  /* Handling NGPs separately because we don't want them to update last_rcvd
+     Otherwise they could be keeping failed connections marked active */
+  if (packet_type == SRTLA_TYPE_REG_NGP) {
+    /* Only process NGPs if:
+       * we don't have any established connections
+       * and we don't already have a pending REG1->REG2 exhange in flight
+       * and we don't have any pending REG2->REG3 exchanges in flight
+    */
+    if (active_connections == 0 && pending_reg2_conn == NULL && ts > pending_reg_timeout) {
+      if (send_reg1(c) == 0) {
+        pending_reg2_conn = c;
+        pending_reg_timeout = ts + REG2_TIMEOUT;
+      }
+    }
+    return;
+
+  } else if (packet_type == SRTLA_TYPE_REG2) {
+    if (pending_reg2_conn == c) {
+      char *id = &buf[2];
+      if (memcmp(id, srtla_id, SRTLA_ID_LEN/2) != 0) {
+        err("%s (%p): got a mismatching ID in SRTLA_REG2\n",
+           print_addr(&c->src), c);
+        return;
+      }
+
+      info("%s (%p): connection group registered\n", print_addr(&c->src), c);
+      memcpy(srtla_id, id, SRTLA_ID_LEN);
+
+      /* Broadcast REG2 */
+      for (conn_t *i = conns; i != NULL; i = i->next) {
+        send_reg2(i);
+      }
+
+      pending_reg2_conn = NULL;
+      pending_reg_timeout = ts + REG3_TIMEOUT;
+    }
+    return;
+  }
+
+  c->last_rcvd = ts;
+
+  switch(packet_type) {
+    case SRT_TYPE_ACK: {
+      uint32_t last_ack = *((uint32_t *)&buf[16]);
+      last_ack = be32toh(last_ack);
+      register_srt_ack(last_ack);
+      break;
+    }
+
+    case SRT_TYPE_NAK: {
+      uint32_t *ids = (uint32_t *)buf;
+      for (int i = 4; i < n/4; i++) {
+        uint32_t id = be32toh(ids[i]);
+        if (id & (1 << 31)) {
+          id = id & 0x7FFFFFFF;
+          uint32_t last_id = be32toh(ids[i+1]);
+          for (int32_t lost = id; lost <= last_id; lost++) {
+            register_nak(lost);
+          }
+          i++;
+        } else {
+          register_nak(id);
+        }
+      }
+      break;
+    }
+
+    // srtla packets below, don't send to SRT
+    case SRTLA_TYPE_ACK: {
+      uint32_t *acks = (uint32_t *)buf;
+      for (int i = 1; i < n/4; i++) {
+        uint32_t id = be32toh(acks[i]);
+        debug("%s (%p): ack %d\n", print_addr(&c->src), c, id);
+        register_srtla_ack(id);
+      }
+      return;
+    }
+
+    case SRTLA_TYPE_KEEPALIVE:
+      clock_gettime(CLOCK_MONOTONIC, &c->last_delivery_proof);
+      debug("%s (%p): got a keepalive\n", print_addr(&c->src), c);
+      return; // don't send to SRT
+
+    case SRTLA_TYPE_REG3:
+      has_connected = 1;
+      // Clear reconnecting state when connection is re-established  
+      is_reconnecting = 0;
+      active_connections++;
+      info("%s (%p): connection established\n", print_addr(&c->src), c);
+#ifdef ANDROID
+      // Call the JNI callback to notify that connection is established
+      extern void srtla_on_connection_established(void);
+      srtla_on_connection_established();
+#endif
+      return;
+  } // switch
+
+  sendto(listenfd, &buf, n, 0, &srt_addr, addr_len);
+}
+
+
+/*
+
+Connection and socket management
+
+*/
+conn_t *conn_find_by_src(struct sockaddr *src) {
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (memcmp(src, &c->src, sizeof(*src)) == 0) {
+      return c;
+    }
+  }
+
+  return NULL;
+}
+
+int setup_conns(char *source_ip_file) {
+  printf("Opening IP file: %s\n", source_ip_file);
+  FILE *config = fopen(source_ip_file, "r");
+  if (config == NULL) {
+    printf("Failed to open the source ip list file: %s\n", source_ip_file);
+    perror("Error details");
+    exit_help();
+  }
+
+  int count = 0;
+  char *line = NULL;
+  size_t line_len = 0;
+  while(getline(&line, &line_len, config) >= 0) {
+    char *nl;
+    if ((nl = strchr(line, '\n'))) {
+      *nl = '\0';
+    }
+
+    printf("Parsing IP line: '%s'\n", line);
+    struct sockaddr src;
+
+    int ret = parse_ip((struct sockaddr_in *)&src, line);
+    if (ret == 0) {
+      printf("Successfully parsed IP: %s\n", line);
+      conn_t *c = conn_find_by_src(&src);
+      if (c == NULL) {
+        conn_t *c = calloc(1, sizeof(conn_t));
+        if (c == NULL) {
+          err("Failed to allocate memory for connection\n");
+          continue;  // Skip this connection, try next
+        }
+
+        c->src = src;
+        c->fd = -1;
+        c->window = WINDOW_DEF * WINDOW_MULT;
+        
+        // Initialize bitrate tracking
+        c->bytes_sent_total = 0;
+        c->bytes_sent_window = 0;
+        c->last_rate_update = time(NULL);
+
+#ifdef ANDROID
+        // Check if this is a virtual IP
+        if (is_virtual_ip(line)) {
+          strncpy(c->virtual_ip, line, sizeof(c->virtual_ip)-1);
+          printf("Configured virtual IP: %s\n", c->virtual_ip);
+          // Copy display name from virtual connection (for relay name in stats)
+          virtual_conn_t vc;
+          if (copy_virtual_connection(line, &vc)) {
+            strncpy(c->display_name, vc.display_name, sizeof(c->display_name)-1);
+            c->has_custom_dest = vc.has_custom_dest;
+            if (vc.has_custom_dest) {
+              memcpy(&c->dest_addr, &vc.dest_addr, sizeof(c->dest_addr));
+            }
+          }
+        } else {
+          c->virtual_ip[0] = '\0';  // Clear virtual IP for real IPs
+        }
+#endif
+
+        c->next = conns;
+        conns = c;
+
+        count++;
+
+        printf("Added connection via %s (%p)\n", print_addr(&c->src), c);
+      } else {
+        c->removed = 0;
+#ifdef ANDROID
+        // A virtual IP identifies a transport, not an Android Network. Adopt the
+        // replacement FD here on the sender thread; otherwise the old socket
+        // stays selected forever even after onAvailable provided a new one.
+        virtual_conn_t vc;
+        if (is_virtual_ip(line) && copy_virtual_connection(line, &vc)
+            && c->fd >= 0 && c->fd != vc.socket_fd) {
+          remove_active_fd(c->fd);
+          close(c->fd);
+          c->fd = -1;
+          c->last_rcvd = 0;
+          c->last_sent = 0;
+          c->window = WINDOW_DEF * WINDOW_MULT;
+          c->in_flight_pkts = 0;
+          c->pkt_idx = 0;
+          c->rtt_ms = 0;
+          c->rtt_samples = 0;
+          c->last_rtt_update = 0;
+          memset(&c->last_delivery_proof, 0, sizeof(c->last_delivery_proof));
+          for (int i = 0; i < PKT_LOG_SZ; i++) c->pkt_log[i] = -1;
+          if (pending_reg2_conn == c) pending_reg2_conn = NULL;
+        }
+#endif
+      }
+    } else {
+      printf("Failed to parse IP: '%s' (error: %d)\n", line, ret);
+    }
+  }
+  if (line) free(line);
+
+  fclose(config);
+
+  return count;
+}
+
+void update_conns(char *source_ip_file) {
+  srtla_lock_connections();
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    c->removed = 1;
+  }
+
+  setup_conns(source_ip_file);
+
+  conn_t **prev = &conns;
+  conn_t *next;
+  for (conn_t *c = conns; c != NULL; c = next) {
+    next = c->next;
+    if (c->removed) {
+      printf("Removed connection via %s (%p)\n", print_addr(&c->src), c);
+
+      if (c == pending_reg2_conn) {
+        pending_reg2_conn = NULL;
+      }
+
+      remove_active_fd(c->fd);
+      close(c->fd);
+      *prev = c->next;
+      free(c);
+    } else {
+      prev = &c->next;
+    }
+  }
+  srtla_unlock_connections();
+}
+
+void schedule_update_conns(int signal) {
+  __atomic_store_n(&do_update_conns, 1, __ATOMIC_RELEASE);
+}
+
+int open_socket(conn_t *c, int quiet) {
+  if (c->fd >= 0) {
+    remove_active_fd(c->fd);
+    close(c->fd);
+    c->fd = -1;
+  }
+
+#ifdef ANDROID
+  // For Android with virtual IPs, use pre-bound network socket
+  if (strlen(c->virtual_ip) > 0) {
+    virtual_conn_t vc;
+    if (copy_virtual_connection(c->virtual_ip, &vc) && vc.socket_fd >= 0) {
+      c->fd = vc.socket_fd;
+      c->network_type = vc.network_type;
+      memcpy(&c->real_src, &vc.real_addr, sizeof(c->real_src));
+      strncpy(c->real_ip, vc.real_ip, sizeof(c->real_ip)-1);
+      c->has_custom_dest = vc.has_custom_dest;
+      if (vc.has_custom_dest) {
+        memcpy(&c->dest_addr, &vc.dest_addr, sizeof(c->dest_addr));
+      }
+      strncpy(c->display_name, vc.display_name, sizeof(c->display_name)-1);
+      
+      add_active_fd(c->fd);
+      
+      info("Using pre-bound socket for virtual IP %s -> real IP %s (fd=%d)\n", 
+           c->virtual_ip, c->real_ip, c->fd);
+      return 0;
+    } else {
+      if (!quiet) {
+        err("No pre-bound socket found for virtual IP %s\n", c->virtual_ip);
+      }
+      return -1;
+    }
+  }
+#endif
+
+  // Fallback to original socket creation for non-Android or non-virtual IPs
+  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+  if (fd < 0) {
+    err("Failed to open a socket");
+    return -1;
+  }
+
+  int bufsize = SEND_BUF_SIZE;
+  int ret = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+  if (ret != 0) {
+    err("failed to set send buffer size (%d)\n", bufsize);
+    goto err;
+  }
+
+  // Bind it to the source address
+  ret = bind(fd, &c->src, sizeof(c->src));
+  if (ret != 0) {
+    if (!quiet) {
+      err("Failed to bind to the source address %s\n", print_addr(&c->src));
+    }
+    goto err;
+  }
+
+  add_active_fd(fd);
+  c->fd = fd;
+
+  return 0;
+
+err:
+  close(fd);
+  return -1;
+}
+
+int open_conns(char *host, char *port) {
+  // Check that we can actually open & bind at least one socket
+  int opened = 0;
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (open_socket(c, 0) == 0) {
+      opened++;
+    }
+  }
+  return opened;
+}
+
+/*
+
+Connection housekeeping
+
+*/
+void set_srtla_addr(struct addrinfo *addr) {
+  memcpy(&srtla_addr, addr->ai_addr, addr->ai_addrlen);
+  info("Trying to connect to %s...\n", print_addr(&srtla_addr));
+}
+
+void send_keepalive(conn_t *c) {
+  debug("%s (%p): sending keepalive\n", print_addr(&c->src), c);
+  uint16_t pkt = htobe16(SRTLA_TYPE_KEEPALIVE);
+  // ignoring the result on purpose
+  sendto(c->fd, &pkt, sizeof(pkt), 0, conn_dest(c), addr_len);
+}
+
+#define HOUSEKEEPING_INT 1000 // ms
+
+static uint64_t all_failed_at_timestamp = 0;  // Track when all connections failed
+
+void connection_housekeeping() {
+  /* We use milliseconds here because with a seconds timer we may be
+     resending a second REG2 very soon after the first one, depending
+     on when the first execution happens within the seconds interval */
+  static uint64_t last_ran = 0;
+  uint64_t ms = 0;
+  if (get_ms(&ms) != 0) return;  // Failed to get time, skip this iteration
+  if ((last_ran + HOUSEKEEPING_INT) > ms) return;
+
+  time_t time = (time_t)(ms / 1000);
+
+  active_connections = 0;
+
+  if (pending_reg2_conn && time > pending_reg_timeout) {
+    pending_reg2_conn = NULL;
+  }
+
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (c->fd < 0) {
+      open_socket(c, 1);
+      continue;
+    }
+
+    int timed_out = conn_timed_out(c, time);
+    
+    if (timed_out) {
+      /* When we first detect the connection having failed,
+         we reset its status and print a message */
+      if (c->last_rcvd > 0) {
+        info("%s (%p): connection failed, attempting to reconnect\n",
+             print_addr(&c->src), c);
+        
+        c->last_rcvd = 0;
+        c->last_sent = 0;
+        c->window = WINDOW_MIN * WINDOW_MULT;
+        c->in_flight_pkts = 0;
+        for (int i = 0; i < PKT_LOG_SZ; i++) {
+          c->pkt_log[i] = -1;
+        }
+      }
+
+      if (pending_reg2_conn == NULL) {
+        /* As the connection has timed out on our end, the receiver might have garbage
+           collected it. Try to re-establish it rather than send a keepalive */
+        send_reg2(c);
+      } else if (pending_reg2_conn == c) {
+        send_reg1(c);
+      }
+      continue;
+    }
+
+    /* If a connection has received data in the last CONN_TIMEOUT seconds,
+       then it's active. Only count connections that have actually received data recently. */
+    if (c->last_rcvd > 0 && (c->last_rcvd + CONN_TIMEOUT) >= time) {
+      active_connections++;
+    }
+
+    if ((c->last_sent + IDLE_TIME) < time) {
+      send_keepalive(c);
+    }
+  }
+
+  if (active_connections == 0) {
+    is_reconnecting = has_connected;
+    if (all_failed_at_timestamp == 0) {
+      all_failed_at_timestamp = ms;
+      info("All connections failed at timestamp: %llu ms\n", (unsigned long long)all_failed_at_timestamp);
+    }
+
+    if (has_connected) {
+      err("warning: no available connections\n");
+    }
+
+    // Timeout when all connections have failed
+    uint64_t timeout_ms = all_failed_at_timestamp + (GLOBAL_TIMEOUT * 1000);
+    info("Checking timeout: ms=%llu, timeout_at=%llu, has_connected=%d\n", 
+         (unsigned long long)ms, (unsigned long long)timeout_ms, has_connected);
+    
+    if (ms > timeout_ms) {
+      if (has_connected) {
+        err("Failed to re-establish any connections to %s\n",
+            print_addr(&srtla_addr));
+        #ifdef ANDROID
+        // Set flag to exit on Android instead of calling exit()
+        srtla_should_stop = 1;
+        #else
+        exit(EXIT_FAILURE);
+        #endif
+      } else {
+        // Initial connection failed - try next DNS address
+        err("Failed to establish any initial connections to %s\n",
+            print_addr(&srtla_addr));
+
+        // Walk through the list of resolved addresses
+        if (addrs->ai_next) {
+          addrs = addrs->ai_next;
+          set_srtla_addr(addrs);
+          all_failed_at_timestamp = 0;
+          info("RESET: Trying next DNS address\n");
+        } else {
+          #ifdef ANDROID
+          // Set flag to exit on Android instead of calling exit()
+          srtla_should_stop = 1;
+          #else
+          exit(EXIT_FAILURE);
+          #endif
+        }
+      }
+    }
+  } else {
+    // A failed leg does not mean the bonded stream disconnected.
+    is_reconnecting = 0;
+    all_failed_at_timestamp = 0;
+    info("RESET: active_connections > 0 (count=%d)\n", active_connections);
+  }
+
+  last_ran = ms;
+}
+
+#define ARG_LISTEN_PORT (argv[1])
+#define ARG_SRTLA_HOST  (argv[2])
+#define ARG_SRTLA_PORT  (argv[3])
+#define ARG_IPS_FILE    (argv[4])
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "-v") == 0) {
+    printf(VERSION "\n");
+    exit(0);
+  }
+  if (argc != 5) exit_help();
+
+  source_ip_file = ARG_IPS_FILE;
+  int conn_count = setup_conns(source_ip_file);
+  if (conn_count <= 0) {
+    fprintf(stderr, "Failed to parse any IP addresses in %s\n", source_ip_file);
+    exit(EXIT_FAILURE);
+  }
+
+  struct sockaddr_in listen_addr;
+
+  int port = parse_port(ARG_LISTEN_PORT);
+  if (port < 0) exit_help();
+
+  // Read a random connection group id for this session
+  FILE *fd = fopen("/dev/urandom", "rb");
+  if (fd == NULL) {
+    perror("Failed to open /dev/urandom");
+    exit(EXIT_FAILURE);
+  }
+  if (fread(srtla_id, 1, SRTLA_ID_LEN, fd) != SRTLA_ID_LEN) {
+    perror("Failed to read from /dev/urandom");
+    fclose(fd);
+    exit(EXIT_FAILURE);
+  }
+  fclose(fd);
+
+  FD_ZERO(&active_fds);
+
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_addr.s_addr = INADDR_ANY;
+  listen_addr.sin_port = htons(port);
+  listenfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (listenfd < 0) { 
+    perror("socket creation failed"); 
+    exit(EXIT_FAILURE); 
+  }
+
+  int ret = bind(listenfd, (struct sockaddr *)&listen_addr, sizeof(listen_addr));
+  if (ret < 0) { 
+    perror("bind failed"); 
+    exit(EXIT_FAILURE); 
+  }
+  add_active_fd(listenfd);
+
+  int connected = open_conns(ARG_SRTLA_HOST, ARG_SRTLA_PORT);
+  if (connected < 1) {
+    err("Failed to open and bind to any of the IP addresses in %s\n", source_ip_file);
+    exit(EXIT_FAILURE);
+  }
+
+  // Resolve the address of the receiver
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  ret = getaddrinfo(ARG_SRTLA_HOST, ARG_SRTLA_PORT, &hints, &addrs);
+  if (ret != 0) {
+    err("Failed to resolve %s: %s\n", ARG_SRTLA_HOST, gai_strerror(ret));
+    exit(EXIT_FAILURE);
+  }
+
+  set_srtla_addr(addrs);
+
+  signal(SIGHUP, schedule_update_conns);
+
+  int info_int = LOG_PKT_INT;
+
+  while(1) {
+    // Check if we should stop
+    if (srtla_should_stop) {
+      printf("SRTLA stopping as requested\n");
+      return 0;
+    }
+    
+    if (__atomic_exchange_n(&do_update_conns, 0, __ATOMIC_ACQ_REL)) {
+      update_conns(source_ip_file);
+    }
+
+    srtla_lock_connections();
+    connection_housekeeping();
+
+    fd_set read_fds = active_fds;
+    srtla_unlock_connections();
+    struct timeval to = {.tv_sec = 0, .tv_usec = 200*1000};
+    ret = select(FD_SETSIZE, &read_fds, NULL, NULL, &to);
+
+    srtla_lock_connections();
+    if (ret > 0) {
+      if (FD_ISSET(listenfd, &read_fds)) {
+        handle_srt_data(listenfd);
+      }
+
+      for (conn_t *c = conns; c != NULL; c = c->next) {
+        if (c->fd >= 0 && FD_ISSET(c->fd, &read_fds)) {
+          handle_srtla_data(c);
+        }
+      }
+    } // ret > 0
+
+    info_int--;
+    if (info_int == 0) {
+      for (conn_t *c = conns; c != NULL; c = c->next) {
+        debug("%s (%p): in flight: %d, window: %d, last_rcvd %ld\n",
+              print_addr(&c->src), c, c->in_flight_pkts, c->window, c->last_rcvd);
+      }
+      info_int = LOG_PKT_INT;
+    }
+    srtla_unlock_connections();
+  } // while(1);
+}
+
+#ifdef ANDROID
+/*
+ * Android-compatible random number generation
+ * Fallback if /dev/urandom is not accessible
+ */
+static int android_get_random(void *buf, size_t len) {
+  FILE *fd = fopen("/dev/urandom", "rb");
+  if (fd != NULL) {
+    size_t result = fread(buf, 1, len, fd);
+    fclose(fd);
+    if (result == len) return 0;
+  }
+  
+  // Fallback: use time-based seed (less secure but functional)
+  srand((unsigned int)time(NULL));
+  unsigned char *bytes = (unsigned char *)buf;
+  for (size_t i = 0; i < len; i++) {
+    bytes[i] = rand() & 0xFF;
+  }
+  return 0;
+}
+#endif // ANDROID
+
+/*
+ * Android stop function - sets stop flag for graceful shutdown
+ */
+void srtla_stop_android(void) {
+  srtla_should_stop = 1;
+}
+
+/*
+ * Android JNI entry point - preserves all original SRTLA functionality
+ * This is identical to main() but callable from JNI
+ */
+int srtla_start_android(const char* listen_port, const char* srtla_host, 
+                       const char* srtla_port, const char* ips_file) {
+  
+  // Reset ALL global state for fresh start
+  srtla_should_stop = 0;
+  has_connected = 0;  // Reset connection state for new attempt
+  active_connections = 0;  // Reset active connection count
+  max_act_fd = -1;  // Reset max file descriptor
+  do_update_conns = 0;  // Reset connection update flag
+  all_failed_at_timestamp = 0;  // Reset failure timestamp
+  listenfd = -1;
+  pending_reg2_conn = NULL;
+  pending_reg_timeout = 0;  // Reset registration timeout
+  is_reconnecting = 0;  // Reset reconnecting flag
+  FD_ZERO(&active_fds);
+  
+  // Free old DNS resolution if it exists
+  if (addrs != NULL) {
+    freeaddrinfo(addrs);
+    addrs = NULL;
+  }
+  
+  // Clear any existing connections from previous runs
+  srtla_lock_connections();
+  while (conns != NULL) {
+    conn_t *next = conns->next;
+    
+#ifdef ANDROID
+    // Only close FDs that native code created, not Java-provided ones
+    if (conns->fd >= 0 && !srtla_is_java_owned_fd(conns->fd)) {
+      printf("Closing native-owned FD %d\n", conns->fd);
+      close(conns->fd);
+    } else if (conns->fd >= 0) {
+      printf("Skipping Java-owned FD %d (will be closed by Java)\n", conns->fd);
+    }
+#else
+    // On non-Android, close all FDs
+    if (conns->fd >= 0) {
+      close(conns->fd);
+    }
+#endif
+    
+    free(conns);
+    conns = next;
+  }
+  conns = NULL;  // Explicitly ensure it's NULL
+  printf("Cleared existing connections for fresh start\n");
+  
+  source_ip_file = (char*)ips_file;  // Cast away const for compatibility
+  printf("About to setup connections from file: %s\n", source_ip_file);
+  int conn_count = setup_conns(source_ip_file);
+  srtla_unlock_connections();
+  printf("setup_conns returned: %d connections\n", conn_count);
+  if (conn_count <= 0) {
+    printf("Failed to parse any IP addresses in %s\n", source_ip_file);
+    return -1;  // Return error instead of exit()
+  }
+  printf("Successfully set up %d connections\n", conn_count);
+
+  struct sockaddr_in listen_addr;
+
+  int port = parse_port((char*)listen_port);  // Cast for compatibility
+  if (port < 0) {
+    printf("Invalid listen port: %s\n", listen_port);
+    return -1;
+  }
+
+  // Android-compatible random ID generation
+  if (android_get_random(srtla_id, SRTLA_ID_LEN) != 0) {
+    printf("Failed to generate random session ID\n");
+    return -1;
+  }
+
+  FD_ZERO(&active_fds);
+
+  listen_addr.sin_family = AF_INET;
+  listen_addr.sin_addr.s_addr = INADDR_ANY;
+  listen_addr.sin_port = htons(port);
+  listenfd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (listenfd < 0) { 
+    printf("socket creation failed\n");
+    return -1;
+  }
+
+  // Enable socket reuse to allow binding to the same port immediately after restart
+  int reuse = 1;
+  if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+    printf("setsockopt SO_REUSEADDR failed\n");
+  }
+
+  int ret = bind(listenfd, (struct sockaddr *)&listen_addr, sizeof(listen_addr));
+  if (ret < 0) { 
+    printf("bind failed\n");
+    return -1;
+  }
+  add_active_fd(listenfd);
+
+  #ifdef ANDROID
+  // On Android, sockets are created asynchronously by Java network callbacks
+  // Don't check open_conns here - just trust that Java will provide them
+  printf("Android: Skipping open_conns check, sockets managed by Java\n");
+  #else
+  int connected = open_conns((char*)srtla_host, (char*)srtla_port);  // Cast for compatibility
+  if (connected < 1) {
+    printf("Failed to open and bind to any of the IP addresses in %s\n", source_ip_file);
+    return -1;
+  }
+  #endif
+
+  // Resolve the address of the receiver
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  ret = getaddrinfo(srtla_host, srtla_port, &hints, &addrs);
+  if (ret != 0) {
+    printf("Failed to resolve %s: %s\n", srtla_host, gai_strerror(ret));
+    return -1;
+  }
+
+  set_srtla_addr(addrs);
+
+  // Skip signal handler setup on Android - not needed for JNI
+  // signal(SIGHUP, schedule_update_conns);
+
+  int info_int = LOG_PKT_INT;
+
+  // Main SRTLA loop - with stop flag check for Android
+  while(!srtla_should_stop) {
+    if (__atomic_exchange_n(&do_update_conns, 0, __ATOMIC_ACQ_REL)) {
+      update_conns(source_ip_file);
+    }
+
+    srtla_lock_connections();
+    connection_housekeeping();
+
+    fd_set read_fds = active_fds;
+    srtla_unlock_connections();
+    struct timeval to = {.tv_sec = 0, .tv_usec = 200*1000};
+    ret = select(FD_SETSIZE, &read_fds, NULL, NULL, &to);
+
+    srtla_lock_connections();
+    if (ret > 0) {
+      if (FD_ISSET(listenfd, &read_fds)) {
+        handle_srt_data(listenfd);
+      }
+
+      for (conn_t *c = conns; c != NULL; c = c->next) {
+        if (c->fd >= 0 && FD_ISSET(c->fd, &read_fds)) {
+          handle_srtla_data(c);
+        }
+      }
+    }
+
+    info_int--;
+    if (info_int == 0) {
+      for (conn_t *c = conns; c != NULL; c = c->next) {
+        debug("%s (%p): in flight: %d, window: %d, last_rcvd %ld\n",
+              print_addr(&c->src), c, c->in_flight_pkts, c->window, c->last_rcvd);
+      }
+      info_int = LOG_PKT_INT;
+    }
+    srtla_unlock_connections();
+  }
+  
+  // If we exit the loop, it means srtla_should_stop was set (failure or user stop)
+  // Return error code for retry
+  return -1;
+}
+
+/*
+ * Android stats functions - minimal stats for UI
+ */
+int srtla_get_connection_count(void) {
+  int count = 0;
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (!c->removed) {
+      count++;
+    }
+  }
+  return count;
+}
+
+int srtla_get_active_connection_count(void) {
+  int count = 0;
+  time_t now;
+  get_seconds(&now);  // Use same clock as last_rcvd
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (c->removed) continue;
+    time_t diff = now - c->last_rcvd;
+    // Consider a connection active if it received data in the last 5 seconds
+    if (diff <= 5 && c->last_rcvd > 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+int srtla_is_reconnecting(void) {
+  return is_reconnecting;
+}
+
+void srtla_clear_reconnecting(void) {
+  is_reconnecting = 0;
+}
+
+int srtla_get_total_in_flight_packets(void) {
+  int total = 0;
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (c->removed) continue;
+    total += c->in_flight_pkts;
+  }
+  return total;
+}
+
+int srtla_get_total_window_size(void) {
+  int total = 0;
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (c->removed) continue;
+    total += c->window;
+  }
+  return total;
+}
+
+// Update bitrate calculations for a specific connection when bytes are sent
+static void update_connection_bitrate(conn_t *c, uint64_t bytes_sent) {
+  // Initialize if this is the first time
+  if (c->last_rate_update == 0) {
+    c->last_rate_update = time(NULL);
+    c->bytes_sent_window = 0;  // This will store last snapshot for difference calculation
+    c->bytes_sent_total = 0;
+  }
+  
+  // Always add bytes to total
+  c->bytes_sent_total += bytes_sent;
+}
+
+// Update individual connection bitrate (matching Java's updateUploadSpeed method)
+static void update_individual_connection_bitrate(conn_t *c) {
+  if (!c || c->removed) return;
+  
+  time_t now = time(NULL);
+  time_t time_diff = now - c->last_rate_update;
+  
+  // Update every 2 seconds like Java implementation
+  if (time_diff >= 2) {
+    uint64_t bytes_diff = c->bytes_sent_total - c->bytes_sent_window;
+    
+    if (time_diff > 0) {
+      // Exact same calculation as Java: (bytesDiff * 8 * 1000.0) / timeDiff
+      // Note: Using seconds instead of milliseconds, so no need for *1000
+      c->current_bitrate_bps = (bytes_diff * 8.0) / time_diff;
+      
+      printf("SRTLA: Connection fd=%d speed update: %llu bytes in %ld sec = %.1f bps\n", 
+             c->fd, (unsigned long long)bytes_diff, (long)time_diff, c->current_bitrate_bps);
+    }
+    
+    c->last_rate_update = now;
+    c->bytes_sent_window = c->bytes_sent_total; // Store current total as snapshot
+  }
+}
+
+// Calculate total bitrate across all connections (matching Java approach)
+static double calculate_total_bitrate(void) {
+  double total_bitrate = 0.0;
+  
+  // First update all connection bitrates
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (!c->removed) {
+      update_individual_connection_bitrate(c);
+    }
+  }
+  
+  // Sum bitrates from active connections (matching Java totalBitrate += conn.getUploadSpeed())
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (!c->removed) {
+      total_bitrate += c->current_bitrate_bps;
+      printf("SRTLA: Connection fd=%d contributing %.1f bps to total\n", 
+             c->fd, c->current_bitrate_bps);
+    }
+  }
+  
+  // Convert to Mbps for display
+  double mbps = total_bitrate / (1000.0 * 1000.0);
+  
+  printf("SRTLA: Total bitrate calculated: %.1f bps (%.2f Mbps)\n", total_bitrate, mbps);
+  
+  return mbps;
+}
+
+// Calculate load percentage for a specific connection
+static int calculate_connection_load_percentage(conn_t *c) {
+  if (c->removed || c->current_bitrate_bps == 0) return 0;
+  
+  // Calculate total bitrate across all active connections
+  double total_bitrate = 0.0;
+  for (conn_t *other = conns; other != NULL; other = other->next) {
+    if (other->removed) continue;
+    total_bitrate += other->current_bitrate_bps;
+  }
+  
+  if (total_bitrate == 0) return 0;
+  
+  // Return percentage based on bitrate ratio (round to nearest integer)
+  return (int)((c->current_bitrate_bps * 100.0) / total_bitrate + 0.5);
+}
+
+// Get detailed per-connection stats formatted as a string
+// Format: "Total Bitrate: X.X Mbps\nIP:port|fd|active|inflight|window|age\n" for each connection
+int srtla_get_connection_details(char* buffer, int buffer_size) {
+  if (!buffer || buffer_size < 100) {
+    return -1;
+  }
+  
+  int pos = 0;
+  
+  // Add total bitrate header
+  double total_bitrate = calculate_total_bitrate();
+  pos += snprintf(buffer + pos, buffer_size - pos, "Total bitrate: %.2f Mbps", total_bitrate);
+  
+  for (conn_t *c = conns; c != NULL; c = c->next) {
+    if (c->removed) continue;
+    
+    // Get connection addresses as strings
+    char real_addr_str[64] = "unknown";
+    char virtual_addr_str[64] = "none";
+    
+    if (c->src.sa_family == AF_INET) {
+      struct sockaddr_in* sin = (struct sockaddr_in*)&c->src;
+      snprintf(real_addr_str, sizeof(real_addr_str), "%s:%d", 
+               inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+    }
+    
+    if (c->virtual_ip[0] != '\0') {
+      snprintf(virtual_addr_str, sizeof(virtual_addr_str), "%s", c->virtual_ip);
+    }
+    
+    // For sender, a connection is active if:
+    // Determine connection type based on virtual IP or real IP
+    const char* conn_type = "UNKNOWN";
+    if (c->display_name[0] != '\0') {
+      conn_type = c->display_name;
+    } else if (c->virtual_ip[0] != '\0') {
+      // Use virtual IP to determine type
+      if (strcmp(c->virtual_ip, "10.0.1.1") == 0) {
+        conn_type = "WIFI";
+      } else if (strcmp(c->virtual_ip, "10.0.2.1") == 0) {
+        conn_type = "CELLULAR";
+      } else if (strcmp(c->virtual_ip, "10.0.3.1") == 0) {
+        conn_type = "ETHERNET";
+      }
+    } else {
+      // Fallback: try to guess from real IP patterns
+      if (c->src.sa_family == AF_INET) {
+        struct sockaddr_in* sin = (struct sockaddr_in*)&c->src;
+        uint32_t ip = ntohl(sin->sin_addr.s_addr);
+        
+        // Common patterns for connection types
+        if ((ip & 0xFF000000U) == 0x64000000U ||     // 100.x.x.x (carrier-grade NAT)
+            (ip & 0xFF000000U) == 0x0B000000U) {     // 11.x.x.x (some carriers)
+          conn_type = "CELLULAR";
+        } else if ((ip & 0xFFFF0000U) == 0xC0A80000U ||  // 192.168.x.x
+                   (ip & 0xFFF00000U) == 0xAC100000U) {  // 172.16-31.x.x
+          // Common private WiFi ranges
+          conn_type = "WIFI";
+        } else if ((ip & 0xFF000000U) == 0x0A000000U &&  // 10.x.x.x range
+                   (ip & 0xFFFFFF00U) != 0x0A000100U &&  // Not 10.0.1.x (WiFi virtual)
+                   (ip & 0xFFFFFF00U) != 0x0A000200U &&  // Not 10.0.2.x (Cellular virtual)
+                   (ip & 0xFFFFFF00U) != 0x0A000300U) {  // Not 10.0.3.x (Ethernet virtual)
+          // 10.x.x.x but not our virtual IP ranges - likely WiFi
+          conn_type = "WIFI";
+        } else if ((ip & 0xFF000000U) != 0x7F000000U &&  // Not 127.x.x.x (localhost)
+                   (ip & 0xF0000000U) != 0xE0000000U &&  // Not 224-255.x.x.x (multicast/reserved)
+                   ip != 0x00000000U) {                  // Not 0.0.0.0
+          // Public IP - likely Ethernet/wired connection
+          conn_type = "ETHERNET";
+        }
+        // Anything else stays as "UNKNOWN" (localhost, multicast, invalid IPs, etc.)
+      }
+    }
+    
+    // Calculate load percentage for this connection
+    int load_percentage = calculate_connection_load_percentage(c);
+    
+    // Convert connection bitrate to Mbps for display
+    double conn_bitrate_mbps = c->current_bitrate_bps / (1000.0 * 1000.0);
+    
+    // Format RTT string - show "N/A" if no samples yet or no recent ACKs
+    char rtt_str[32];
+    time_t now = time(NULL);
+    if (c->rtt_samples > 0 && (now - c->last_rtt_update) < 5) {
+      // Show RTT only if we've received an ACK in the last 5 seconds
+      snprintf(rtt_str, sizeof(rtt_str), "%.0f ms", c->rtt_ms);
+    } else {
+      snprintf(rtt_str, sizeof(rtt_str), "N/A");
+    }
+    
+    // Show in-flight packets as 0 if no recent activity (no ACKs in last 5 seconds)
+    // This prevents showing stale packet counts when streaming stops
+    int display_in_flight = (now - c->last_rtt_update) < 5 ? c->in_flight_pkts : 0;
+    
+    // Add connection details to buffer with connection type, load info, RTT, and individual bitrate
+    int written = snprintf(buffer + pos, buffer_size - pos,
+                          "\n\n%s\n"
+                          "  Bitrate: %.2f Mbps %d%%\n"
+                          "  Window: %d\n"
+                          "  Packets in-flight: %d\n"
+                          "  RTT: %s",
+                          conn_type,
+                          conn_bitrate_mbps, load_percentage, c->window, display_in_flight, rtt_str);
+    
+    if (written < 0 || pos + written >= buffer_size - 1) {
+      break; // Buffer full
+    }
+    pos += written;
+  }
+  
+  return pos; // Return total bytes written
+}
+
+// Get individual connection bitrates for Android UI
+// Returns number of connections, fills arrays with connection info
+// Arrays must be pre-allocated with at least max_connections elements
+int srtla_get_connection_bitrates(double* bitrates_mbps, char connection_types[][16], 
+                                  char connection_ips[][64], int* load_percentages,
+                                  int max_connections) {
+  if (!bitrates_mbps || !connection_types || !connection_ips || !load_percentages) {
+    return -1;
+  }
+  
+  int conn_count = 0;
+  
+  // Update all connection bitrates first
+  for (conn_t *c = conns; c != NULL && conn_count < max_connections; c = c->next) {
+    if (c->removed) continue;
+    
+    update_individual_connection_bitrate(c);
+    
+    // Convert bitrate to Mbps
+    bitrates_mbps[conn_count] = c->current_bitrate_bps / (1000.0 * 1000.0);
+    
+    // Get connection type
+    const char* conn_type = "UNKNOWN";
+    if (c->display_name[0] != '\0') {
+      conn_type = c->display_name;
+    } else if (c->virtual_ip[0] != '\0') {
+      if (strcmp(c->virtual_ip, "10.0.1.1") == 0) {
+        conn_type = "WIFI";
+      } else if (strcmp(c->virtual_ip, "10.0.2.1") == 0) {
+        conn_type = "CELLULAR";
+      } else if (strcmp(c->virtual_ip, "10.0.3.1") == 0) {
+        conn_type = "ETHERNET";
+      }
+    }
+    strncpy(connection_types[conn_count], conn_type, 15);
+    connection_types[conn_count][15] = '\0';
+    
+    // Get connection IP
+    char addr_str[64] = "unknown";
+    if (c->src.sa_family == AF_INET) {
+      struct sockaddr_in* sin = (struct sockaddr_in*)&c->src;
+      snprintf(addr_str, sizeof(addr_str), "%s:%d", 
+               inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+    }
+    strncpy(connection_ips[conn_count], addr_str, 63);
+    connection_ips[conn_count][63] = '\0';
+    
+    // Get load percentage
+    load_percentages[conn_count] = calculate_connection_load_percentage(c);
+    
+    conn_count++;
+  }
+  
+  return conn_count;
+}
+
+// Get comprehensive connection data for UI visualization
+// Returns number of connections, fills arrays with all connection info needed for ConnectionWindowData
+int srtla_get_connection_window_data(double* bitrates_mbps, char connection_types[][16], 
+                                    char connection_ips[][64], int* load_percentages,
+                                    int* window_sizes, int* inflight_packets,
+                                    int max_connections) {
+  if (!bitrates_mbps || !connection_types || !connection_ips || !load_percentages || 
+      !window_sizes || !inflight_packets) {
+    return -1;
+  }
+  
+  int conn_count = 0;
+  time_t now = time(NULL);
+  
+  // Update all connection bitrates first
+  for (conn_t *c = conns; c != NULL && conn_count < max_connections; c = c->next) {
+    if (c->removed) continue;
+    
+    update_individual_connection_bitrate(c);
+    
+    // Convert bitrate to Mbps
+    bitrates_mbps[conn_count] = c->current_bitrate_bps / (1000.0 * 1000.0);
+    
+    // Get actual window size and in-flight packets from native data
+    window_sizes[conn_count] = c->window;
+    // Show in-flight as 0 if no recent ACKs (prevents stale data when streaming stops)
+    inflight_packets[conn_count] = (now - c->last_rtt_update) < 5 ? c->in_flight_pkts : 0;
+    
+    // Get connection type
+    const char* conn_type = "UNKNOWN";
+    if (c->virtual_ip[0] != '\0') {
+      if (strcmp(c->virtual_ip, "10.0.1.1") == 0) {
+        conn_type = "WIFI";
+      } else if (strcmp(c->virtual_ip, "10.0.2.1") == 0) {
+        conn_type = "CELLULAR";
+      } else if (strcmp(c->virtual_ip, "10.0.3.1") == 0) {
+        conn_type = "ETHERNET";
+      }
+    }
+    strncpy(connection_types[conn_count], conn_type, 15);
+    connection_types[conn_count][15] = '\0';
+    
+    // Get connection IP
+    char addr_str[64] = "unknown";
+    if (c->src.sa_family == AF_INET) {
+      struct sockaddr_in* sin = (struct sockaddr_in*)&c->src;
+      snprintf(addr_str, sizeof(addr_str), "%s:%d", 
+               inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+    }
+    strncpy(connection_ips[conn_count], addr_str, 63);
+    connection_ips[conn_count][63] = '\0';
+    
+    // Get load percentage
+    load_percentages[conn_count] = calculate_connection_load_percentage(c);
+    
+    conn_count++;
+  }
+  
+  return conn_count;
+}
+
+// Check if connection is established and notify JNI
+void check_connection_established(void) {
+  static int connection_established = 0;
+  
+  if (!connection_established) {
+    // Check if we have any active connections with data
+    for (conn_t *c = conns; c != NULL; c = c->next) {
+      if (!c->removed && c->last_rcvd > 0) {
+        connection_established = 1;
+        // Call the JNI callback to notify connection established
+        extern void srtla_on_connection_established(void);
+        srtla_on_connection_established();
+        debug("Connection established, notifying JNI\n");
+        break;
+      }
+    }
+  }
+}
+
+#ifdef ANDROID
+// Virtual IP socket mapping structure
+#define MAX_VIRTUAL_IPS 10
+
+typedef struct {
+  char virtual_ip[INET_ADDRSTRLEN];
+  char real_ip[INET_ADDRSTRLEN];
+  int network_type;  // 0=unknown, 1=wifi, 2=cellular
+  int socket_fd;
+} virtual_ip_socket_t;
+
+static virtual_ip_socket_t virtual_ip_sockets[MAX_VIRTUAL_IPS];
+static int virtual_ip_count = 0;
+
+// Function to clear all virtual IP socket mappings
+void srtla_clear_all_sockets() {
+  printf("Clearing all virtual IP socket mappings\n");
+  for (int i = 0; i < MAX_VIRTUAL_IPS; i++) {
+    if (virtual_ip_sockets[i].socket_fd >= 0) {
+      // Don't close the FD here - Java owns it and will close it
+      printf("Clearing virtual IP socket mapping %d: %s -> %s (fd=%d)\n", 
+             i, virtual_ip_sockets[i].virtual_ip, 
+             virtual_ip_sockets[i].real_ip, 
+             virtual_ip_sockets[i].socket_fd);
+    }
+    virtual_ip_sockets[i].socket_fd = -1;
+    memset(virtual_ip_sockets[i].virtual_ip, 0, sizeof(virtual_ip_sockets[i].virtual_ip));
+    memset(virtual_ip_sockets[i].real_ip, 0, sizeof(virtual_ip_sockets[i].real_ip));
+    virtual_ip_sockets[i].network_type = 0;
+  }
+  virtual_ip_count = 0;
+}
+
+#endif // ANDROID
+
