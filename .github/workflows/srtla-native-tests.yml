@@ -1,0 +1,18 @@
+name: SRTLA native handover tests
+on:
+  pull_request:
+  push:
+    branches: [main, "fix/srtla-handover-bitrate"]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dimadesu/srtla
+          ref: b81ceb604e5d848aa1e6cf2157114f4cf9708b9b
+          path: srtla
+      - run: sh tests/native/run.sh
